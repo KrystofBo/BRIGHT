@@ -249,6 +249,99 @@ def retrieval_sbert_bge(queries,query_ids,documents,doc_ids,task,instructions,mo
 
 
 @torch.no_grad()
+def retrieval_reasonir(queries, query_ids, documents, doc_ids, task,
+                       instructions, model_id, cache_dir, excluded_ids, long_context, **kwargs):
+    if model_id == 'reasonir-bert':
+        hf_model_name = 'KrystofBo/ReasonIR-BERT-base'
+        trust_remote_code = False
+        default_max_length = 512
+        default_batch_size = 128
+    elif model_id == 'bert':
+        hf_model_name = 'bert-base-uncased'
+        trust_remote_code = False
+        default_max_length = 512
+        default_batch_size = 128
+    elif model_id == 'reasonir-modern-bert':
+        hf_model_name = 'KrystofBo/ReasonIR-ModernBERT-base'
+        trust_remote_code = True
+        default_max_length = 8192
+        default_batch_size = 16
+    else:
+        raise ValueError(f"The model {model_id} is not supported by retrieval_reasonir")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_name, trust_remote_code=trust_remote_code)
+    model = AutoModel.from_pretrained(hf_model_name, trust_remote_code=trust_remote_code).to(device).eval()
+
+    batch_size = kwargs.get('batch_size', default_batch_size)
+    max_length = kwargs.get('doc_max_length', default_max_length)
+
+    # CLS pooling for BERT/ModernBERT-style dense retrievers
+    def cls_pool(last_hidden_states, attention_mask):
+        # [B, L, H] -> [B, H]; CLS is at position 0
+        return last_hidden_states[:, 0]
+
+    cache_path = os.path.join(
+        cache_dir, 'doc_emb', model_id, task,
+        f"long_{long_context}_{batch_size}.npy"
+    )
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
+    # --- document embeddings with caching ---
+    if os.path.isfile(cache_path):
+        doc_emb = np.load(cache_path, allow_pickle=True)
+    else:
+        all_doc_embs = []
+        for start_idx in trange(0, len(documents), batch_size):
+            batch_docs = documents[start_idx:start_idx + batch_size]
+            batch_dict = tokenizer(
+                batch_docs,
+                max_length=max_length,
+                padding=True,
+                truncation=True,
+                return_tensors='pt'
+            ).to(device)
+            outputs = model(**batch_dict)
+            embeddings = cls_pool(
+                outputs.last_hidden_state,
+                batch_dict['attention_mask']
+            ).cpu().numpy()
+            all_doc_embs.append(embeddings)
+        doc_emb = np.concatenate(all_doc_embs, axis=0)
+        np.save(cache_path, doc_emb)
+
+    doc_emb = torch.tensor(doc_emb)
+    doc_emb = F.normalize(doc_emb, p=2, dim=1)
+
+    # --- query embeddings (no cache) ---
+    all_query_embs = []
+    for start_idx in trange(0, len(queries), batch_size):
+        batch_queries = queries[start_idx:start_idx + batch_size]
+        batch_dict = tokenizer(
+            batch_queries,
+            max_length=max_length,
+            padding=True,
+            truncation=True,
+            return_tensors='pt'
+        ).to(device)
+        outputs = model(**batch_dict)
+        embeddings = cls_pool(
+            outputs.last_hidden_state,
+            batch_dict['attention_mask']
+        ).cpu().numpy()
+        all_query_embs.append(embeddings)
+
+    query_emb = torch.tensor(np.concatenate(all_query_embs, axis=0))
+    query_emb = F.normalize(query_emb, p=2, dim=1)
+
+    scores = (query_emb @ doc_emb.T) * 100
+    scores = scores.tolist()
+
+    return get_scores(query_ids=query_ids, doc_ids=doc_ids, scores=scores, excluded_ids=excluded_ids)
+
+
+
+@torch.no_grad()
 def retrieval_instructor(queries,query_ids,documents,doc_ids,task,instructions,model_id,cache_dir,excluded_ids,long_context,**kwargs):
     if model_id=='inst-l':
         model = SentenceTransformer('hkunlp/instructor-large')
@@ -538,7 +631,10 @@ RETRIEVAL_FUNCS = {
     'cohere': retrieval_cohere,
     'voyage': retrieval_voyage,
     'openai': retrieval_openai,
-    'google': retrieval_google
+    'google': retrieval_google,
+    'reasonir-bert': retrieval_reasonir,
+    'reasonir-modern-bert': retrieval_reasonir,
+    'bert': retrieval_reasonir
 }
 
 def calculate_retrieval_metrics(results, qrels, k_values=[1, 5, 10, 25, 50, 100]):
